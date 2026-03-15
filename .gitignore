@@ -1,0 +1,17 @@
+build/
+tmp/
+*.obj
+*.exp
+*.lib
+*.exe
+
+.vs/
+.vscode/
+*.user
+*.suo
+*.pdb
+*.ilk
+*.log
+
+Thumbs.db
+Desktop.ini
