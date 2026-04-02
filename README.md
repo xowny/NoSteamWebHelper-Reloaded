@@ -56,4 +56,3 @@ It also refreshes the release payload in `release\steam`.
 
 - This fork currently runs in automatic mode only.
 - If you pass `-silent` to Steam, the browser UI will stay out of the way more reliably when Steam restores itself.
-- The original upstream project is deprecated; this folder is organized as a clean standalone repo for publishing.
