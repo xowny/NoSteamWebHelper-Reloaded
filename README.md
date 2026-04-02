@@ -1,5 +1,8 @@
 # NoSteamWebHelper Reloaded
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+
 `NoSteamWebHelper Reloaded` is a maintained compatibility fork of the original `NoSteamWebHelper` DLL mod for current Steam builds.
 
 Original upstream project:
