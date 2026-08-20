@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2
 
 - Replaced full `steamwebhelper.exe` thread suspension with reversible `BELOW_NORMAL` priority and Windows Efficiency Mode. This avoids Steam IPC stalls that could produce sharp frametime and uncapped-FPS swings.
 - Removed the system-wide process snapshot and repeated priority changes that previously ran every four seconds during gameplay. A snapshot is now taken only once when a game starts.
