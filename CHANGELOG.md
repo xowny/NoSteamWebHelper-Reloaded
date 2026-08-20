@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Replaced full `steamwebhelper.exe` thread suspension with reversible `BELOW_NORMAL` priority and Windows Efficiency Mode. This avoids Steam IPC stalls that could produce sharp frametime and uncapped-FPS swings.
+- Removed the system-wide process snapshot and repeated priority changes that previously ran every four seconds during gameplay. A snapshot is now taken only once when a game starts.
+- Restores the original WebHelper priority and power-throttling state when the game exits.
+- Connected the runtime monitor to the shared, regression-tested auto-toggle state function.
+- Removed worker-thread synchronization from `DllMain` and pin the active proxy for the lifetime of `steam.exe`, avoiding a loader-lock timeout during shutdown.
+
 ## 1.1 — 2026-06-25
 
 - Removed dead tray code entirely (ShowTrayMenu, WndProc, TrayThreadProc, g_manualOverride, shellapi.h include). The DLL now runs fully automatic; no tray icon or manual override.

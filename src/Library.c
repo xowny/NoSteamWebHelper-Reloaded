@@ -3,41 +3,35 @@
 
 #include "State.h"
 
-/* ------------------------------------------------------------------ */
-/*  NT API function pointers for suspended process management         */
-/* ------------------------------------------------------------------ */
-typedef LONG NTSTATUS;
+typedef BOOL(WINAPI *pfnGetProcessInformation)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+typedef BOOL(WINAPI *pfnSetProcessInformation)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
 
-#ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
-#endif
-
-typedef NTSTATUS(NTAPI *pfnNtSuspendProcess)(HANDLE);
-typedef NTSTATUS(NTAPI *pfnNtResumeProcess)(HANDLE);
-
-static pfnNtSuspendProcess g_NtSuspendProcess = NULL;
-static pfnNtResumeProcess  g_NtResumeProcess  = NULL;
-
-/* ------------------------------------------------------------------ */
-/*  Tracking which PIDs we have suspended (idempotent suspend)        */
-/* ------------------------------------------------------------------ */
-#define MAX_SUSPENDED_PIDS  64
-static DWORD  g_suspendedPids[MAX_SUSPENDED_PIDS];
-static LONG   g_suspendedPidCount = 0;
-
-/* ------------------------------------------------------------------ */
-/*  One-time initialisation called from DllMain / DLL_PROCESS_ATTACH  */
-/* ------------------------------------------------------------------ */
-static BOOL InitSuspendResume(void)
+typedef struct PARKED_PROCESS
 {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (ntdll == NULL)
-        return FALSE;
+    DWORD processId;
+    HANDLE processHandle;
+    DWORD originalPriorityClass;
+    BOOL originalEfficiencyMode;
+    BOOL hasOriginalEfficiencyMode;
+} PARKED_PROCESS;
 
-    g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(ntdll, "NtSuspendProcess");
-    g_NtResumeProcess  = (pfnNtResumeProcess) GetProcAddress(ntdll, "NtResumeProcess");
+#define MAX_PARKED_PROCESSES 64
+static PARKED_PROCESS g_parkedProcesses[MAX_PARKED_PROCESSES] = {};
+static LONG g_parkedProcessCount = 0;
+static pfnGetProcessInformation g_GetProcessInformation = NULL;
+static pfnSetProcessInformation g_SetProcessInformation = NULL;
 
-    return (g_NtSuspendProcess != NULL && g_NtResumeProcess != NULL);
+static void InitProcessInformation(void)
+{
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+
+    if (kernel32 == NULL)
+        return;
+
+    g_GetProcessInformation =
+        (pfnGetProcessInformation)GetProcAddress(kernel32, "GetProcessInformation");
+    g_SetProcessInformation =
+        (pfnSetProcessInformation)GetProcAddress(kernel32, "SetProcessInformation");
 }
 
 typedef struct PROCESS_NODE
@@ -49,7 +43,7 @@ typedef struct PROCESS_NODE
 
 #define MAX_TRACKED_PROCESSES 2048
 
-static volatile LONG g_webHelperDisabled = FALSE;
+static volatile LONG g_webHelperParked = FALSE;
 static HANDLE g_stopEvent = NULL;
 
 static BOOL IsSteamClientProcess(void)
@@ -91,36 +85,6 @@ static BOOL ReadSteamAppRunning(DWORD appId)
            running != FALSE;
 }
 
-static BOOL IsIgnoredChildProcessName(LPCWSTR imageName)
-{
-    /*
-     * Known Steam infrastructure processes that are NOT games.
-     * millennium.* processes are the Steam Deck / Steam UI framework
-     * (currently also used on desktop Steam).
-     */
-    static const LPCWSTR kIgnoredNames[] = {
-        L"steam.exe",
-        L"steamwebhelper.exe",
-        L"steamservice.exe",
-        L"gameoverlayui.exe",
-        L"gameoverlayui64.exe",
-        L"crashpad_handler.exe",
-        L"steamerrorreporter.exe",
-        L"steamerrorreporter64.exe",
-        L"millennium.crashhandler64.exe",
-        L"millennium.luavm64.exe",
-    };
-    DWORD index = 0;
-
-    for (; index < ARRAYSIZE(kIgnoredNames); index++)
-    {
-        if (CompareStringOrdinal(imageName, -1, kIgnoredNames[index], -1, TRUE) == CSTR_EQUAL)
-            return TRUE;
-    }
-
-    return FALSE;
-}
-
 static DWORD SnapshotProcesses(PROCESS_NODE *processes, DWORD capacity)
 {
     HANDLE snapshot = INVALID_HANDLE_VALUE;
@@ -141,7 +105,11 @@ static DWORD SnapshotProcesses(PROCESS_NODE *processes, DWORD capacity)
 
             processes[count].processId = entry.th32ProcessID;
             processes[count].parentProcessId = entry.th32ParentProcessID;
-            lstrcpynW(processes[count].imageName, entry.szExeFile, ARRAYSIZE(processes[count].imageName));
+            if (lstrcpynW(processes[count].imageName, entry.szExeFile,
+                          ARRAYSIZE(processes[count].imageName)) == NULL)
+            {
+                processes[count].imageName[0] = L'\0';
+            }
             count++;
         } while (Process32NextW(snapshot, &entry));
     }
@@ -185,61 +153,7 @@ static BOOL IsDescendantProcess(const PROCESS_NODE *processes, DWORD count, DWOR
     return FALSE;
 }
 
-static BOOL HasLiveGameProcess(const PROCESS_NODE *processes, DWORD count, DWORD steamProcessId)
-{
-    DWORD index = 0;
-
-    if (processes == NULL || count == 0)
-        return FALSE;
-
-    for (; index < count; index++)
-    {
-        if (processes[index].processId == steamProcessId)
-            continue;
-
-        if (!IsDescendantProcess(processes, count, processes[index].processId, steamProcessId))
-            continue;
-
-        if (IsIgnoredChildProcessName(processes[index].imageName))
-            continue;
-
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-static void SetGameProcessPriority(const PROCESS_NODE *processes, DWORD count,
-                                   DWORD steamProcessId, DWORD priorityClass)
-{
-    DWORD index = 0;
-
-    if (processes == NULL || count == 0)
-        return;
-
-    for (; index < count; index++)
-    {
-        HANDLE processHandle = NULL;
-
-        if (processes[index].processId == steamProcessId)
-            continue;
-
-        if (!IsDescendantProcess(processes, count, processes[index].processId, steamProcessId))
-            continue;
-
-        if (IsIgnoredChildProcessName(processes[index].imageName))
-            continue;
-
-        processHandle = OpenProcess(PROCESS_SET_INFORMATION, FALSE, processes[index].processId);
-        if (processHandle != NULL)
-        {
-            SetPriorityClass(processHandle, priorityClass);
-            CloseHandle(processHandle);
-        }
-    }
-}
-
-static void SetSteamEfficiencyMode(BOOL enable)
+static void SetEfficiencyMode(HANDLE processHandle, BOOL enable)
 {
     /*
      * SetProcessInformation with ProcessPowerThrottling enables the
@@ -249,157 +163,164 @@ static void SetSteamEfficiencyMode(BOOL enable)
      * Available since Windows 10 (build 1511+).  We load the function
      * dynamically so the DLL degrades gracefully on older systems.
      */
-    typedef BOOL(WINAPI *pfnSetProcessInformation)(HANDLE, INT, LPVOID, DWORD);
-    static pfnSetProcessInformation g_fn = NULL;
+    PROCESS_POWER_THROTTLING_STATE ppt = {};
 
-    if (g_fn == NULL)
-    {
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-        if (hKernel32 != NULL)
-            g_fn = (pfnSetProcessInformation)GetProcAddress(hKernel32, "SetProcessInformation");
-        if (g_fn == NULL)
-            return;
-    }
+    if (g_SetProcessInformation == NULL)
+        return;
 
-    PROCESS_POWER_THROTTLING_STATE ppt;
     ppt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
     ppt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
     ppt.StateMask   = enable ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
 
-    g_fn(GetCurrentProcess(), ProcessPowerThrottling, &ppt, sizeof(ppt));
+    g_SetProcessInformation(processHandle, ProcessPowerThrottling, &ppt, sizeof(ppt));
 }
 
-static BOOL IsAlreadySuspended(DWORD pid)
+static BOOL IsAlreadyParked(DWORD processId)
 {
-    LONG i;
+    LONG index = 0;
 
-    for (i = 0; i < g_suspendedPidCount; i++)
+    for (; index < g_parkedProcessCount; index++)
     {
-        if (g_suspendedPids[i] == pid)
+        if (g_parkedProcesses[index].processId == processId)
             return TRUE;
     }
 
     return FALSE;
 }
 
-static void AddSuspendedPid(DWORD pid)
+static void ParkSteamWebHelpers(const PROCESS_NODE *processes, DWORD count, DWORD steamProcessId)
 {
-    if (g_suspendedPidCount < MAX_SUSPENDED_PIDS)
-        g_suspendedPids[g_suspendedPidCount++] = pid;
-}
-
-static void SuspendSteamWebHelpers(const PROCESS_NODE *processes, DWORD count, DWORD steamProcessId)
-{
-    DWORD index = 0;
+    DWORD processIndex = 0;
 
     if (processes == NULL || count == 0)
         return;
 
-    for (; index < count; index++)
+    for (; processIndex < count; processIndex++)
     {
         HANDLE processHandle = NULL;
+        PARKED_PROCESS *parked = NULL;
+        PROCESS_POWER_THROTTLING_STATE originalPowerThrottling = {};
 
-        if (CompareStringOrdinal(processes[index].imageName, -1, L"steamwebhelper.exe", -1, TRUE) != CSTR_EQUAL)
+        if (CompareStringOrdinal(processes[processIndex].imageName, -1,
+                                 L"steamwebhelper.exe", -1, TRUE) != CSTR_EQUAL)
             continue;
 
-        if (!IsDescendantProcess(processes, count, processes[index].processId, steamProcessId))
+        if (!IsDescendantProcess(processes, count, processes[processIndex].processId, steamProcessId))
             continue;
 
-        if (IsAlreadySuspended(processes[index].processId))
+        if (IsAlreadyParked(processes[processIndex].processId))
             continue;
+
+        if (g_parkedProcessCount >= MAX_PARKED_PROCESSES)
+            continue;
+
+        processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION |
+                                        SYNCHRONIZE,
+                                    FALSE, processes[processIndex].processId);
+        if (processHandle == NULL)
+            continue;
+
+        parked = &g_parkedProcesses[g_parkedProcessCount];
+        parked->processId = processes[processIndex].processId;
+        parked->processHandle = processHandle;
+        parked->originalPriorityClass = GetPriorityClass(processHandle);
+        parked->hasOriginalEfficiencyMode = FALSE;
+
+        if (g_GetProcessInformation != NULL)
+        {
+            originalPowerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            parked->hasOriginalEfficiencyMode =
+                g_GetProcessInformation(processHandle, ProcessPowerThrottling,
+                                        &originalPowerThrottling,
+                                        sizeof(originalPowerThrottling));
+
+            if (parked->hasOriginalEfficiencyMode)
+            {
+                parked->originalEfficiencyMode =
+                    (originalPowerThrottling.StateMask &
+                     PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0;
+            }
+        }
 
         /*
-         * Open with both SUSPEND_RESUME (to freeze threads) and
-         * SET_QUOTA (to trim the working set / free RAM).
-         */
-        processHandle = OpenProcess(PROCESS_SUSPEND_RESUME | PROCESS_SET_QUOTA, FALSE,
-                                    processes[index].processId);
-        if (processHandle == NULL)
-        {
-            OutputDebugStringW(L"umpdc: suspend+quota denied, falling back to kill");
-            processHandle = OpenProcess(PROCESS_TERMINATE, FALSE, processes[index].processId);
-            if (processHandle != NULL)
-            {
-                TerminateProcess(processHandle, EXIT_SUCCESS);
-                CloseHandle(processHandle);
-            }
-            else
-            {
-                OutputDebugStringW(L"umpdc: terminate access also denied, skipping");
-            }
-            continue;
-        }
-
-        /* Freeze every thread so CEF doesn't notice */
-        if (g_NtSuspendProcess == NULL ||
-            !NT_SUCCESS(g_NtSuspendProcess(processHandle)))
-        {
-            CloseHandle(processHandle);
-
-            processHandle = OpenProcess(PROCESS_TERMINATE, FALSE, processes[index].processId);
-            if (processHandle != NULL)
-            {
-                TerminateProcess(processHandle, EXIT_SUCCESS);
-                CloseHandle(processHandle);
-            }
-            continue;
-        }
-
-        /* Trim the working set to zero to free RAM */
-        {
-            typedef BOOL(WINAPI *pfnSetProcessWorkingSetSize)(HANDLE, SIZE_T, SIZE_T);
-            static pfnSetProcessWorkingSetSize g_SetWsSize = NULL;
-
-            if (g_SetWsSize == NULL)
-                g_SetWsSize = (pfnSetProcessWorkingSetSize)
-                    GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                   "SetProcessWorkingSetSize");
-
-            if (g_SetWsSize != NULL)
-                g_SetWsSize(processHandle, (SIZE_T)-1, (SIZE_T)-1);
-        }
-
-        AddSuspendedPid(processes[index].processId);
-        CloseHandle(processHandle);
+         * Keep CEF responsive so Steam IPC calls do not block the game.
+         * BELOW_NORMAL plus EcoQoS reduces background contention without
+         * the frametime spikes caused by suspending all helper threads.
+        */
+        SetPriorityClass(processHandle, BELOW_NORMAL_PRIORITY_CLASS);
+        if (parked->hasOriginalEfficiencyMode)
+            SetEfficiencyMode(processHandle, TRUE);
+        g_parkedProcessCount++;
     }
 }
 
-static void ResumeAllSuspended(void)
+static void RestoreParkedWebHelpers(void)
 {
-    LONG i;
+    LONG index = 0;
+    LONG parkedCount = g_parkedProcessCount;
 
-    for (i = 0; i < g_suspendedPidCount; i++)
+    if (parkedCount < 0)
+        parkedCount = 0;
+    else if (parkedCount > MAX_PARKED_PROCESSES)
+        parkedCount = MAX_PARKED_PROCESSES;
+
+    for (; index < parkedCount; index++)
     {
-        HANDLE processHandle = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, g_suspendedPids[i]);
-        if (processHandle != NULL)
+        PARKED_PROCESS *parked = &g_parkedProcesses[index];
+
+        if (parked->processHandle == NULL)
         {
-            if (g_NtResumeProcess != NULL)
-                g_NtResumeProcess(processHandle);
-            CloseHandle(processHandle);
+            ZeroMemory(parked, sizeof(*parked));
+            continue;
         }
+
+#pragma warning(suppress : 6001) /* Guarded above; array storage is statically zero-initialized. */
+        if (WaitForSingleObject(parked->processHandle, 0) == WAIT_TIMEOUT)
+        {
+            if (parked->originalPriorityClass != 0)
+                SetPriorityClass(parked->processHandle, parked->originalPriorityClass);
+
+            if (parked->hasOriginalEfficiencyMode)
+                SetEfficiencyMode(parked->processHandle, parked->originalEfficiencyMode);
+        }
+
+        CloseHandle(parked->processHandle);
+        ZeroMemory(parked, sizeof(*parked));
     }
 
-    g_suspendedPidCount = 0;
+    g_parkedProcessCount = 0;
 }
 
 static DWORD WINAPI MonitorThreadProc(LPVOID parameter)
 {
     DWORD steamProcessId = GetCurrentProcessId();
+    HMODULE pinnedModule = NULL;
     PROCESS_NODE *processes = NULL;
     UNREFERENCED_PARAMETER(parameter);
+
+    /*
+     * The proxy is intended to live for the lifetime of steam.exe.
+     * Pin it from the worker, after DllMain has released the loader lock,
+     * so Steam cannot unload code while this thread is still executing.
+     */
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            (LPCWSTR)MonitorThreadProc, &pinnedModule) ||
+        pinnedModule == NULL)
+    {
+        return 0;
+    }
 
     if (WaitForSingleObject(g_stopEvent, 5000) != WAIT_TIMEOUT)
         return 0;
 
     processes = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*processes) * MAX_TRACKED_PROCESSES);
 
-    while (WaitForSingleObject(g_stopEvent, 4000) == WAIT_TIMEOUT)
+    while (WaitForSingleObject(g_stopEvent, 1000) == WAIT_TIMEOUT)
     {
         DWORD runningAppId = 0;
         BOOL appMarkedRunning = FALSE;
-        BOOL liveGameProcess = FALSE;
-        DWORD count = 0;
-        BOOL shouldDisable;
+        BOOL shouldPark;
 
         /* AUTO mode: detect whether a game is running. */
         runningAppId = ReadSteamDwordValue(L"SOFTWARE\\Valve\\Steam", L"RunningAppID", 0);
@@ -407,54 +328,36 @@ static DWORD WINAPI MonitorThreadProc(LPVOID parameter)
         if (runningAppId != 0)
             appMarkedRunning = ReadSteamAppRunning(runningAppId);
 
-        if (processes != NULL)
-        {
-            count = SnapshotProcesses(processes, MAX_TRACKED_PROCESSES);
-            liveGameProcess = HasLiveGameProcess(processes, count, steamProcessId);
-        }
+        shouldPark = ShouldParkWebHelper(runningAppId, appMarkedRunning);
 
-        shouldDisable = runningAppId != 0 && appMarkedRunning;
-
-        if (shouldDisable)
+        if (shouldPark &&
+            !InterlockedCompareExchange(&g_webHelperParked, TRUE, FALSE))
         {
-            InterlockedExchange(&g_webHelperDisabled, TRUE);
             if (processes != NULL)
             {
-                OutputDebugStringW(L"umpdc: game detected, suspending webhelpers");
-                SuspendSteamWebHelpers(processes, count, steamProcessId);
-
-                SetGameProcessPriority(processes, count, steamProcessId,
-                                       ABOVE_NORMAL_PRIORITY_CLASS);
+                DWORD count = SnapshotProcesses(processes, MAX_TRACKED_PROCESSES);
+                OutputDebugStringW(L"umpdc: game detected, parking webhelpers");
+                ParkSteamWebHelpers(processes, count, steamProcessId);
             }
 
-            SetSteamEfficiencyMode(TRUE);
         }
-        else if (InterlockedCompareExchange(&g_webHelperDisabled, FALSE, TRUE))
+        else if (!shouldPark &&
+                 InterlockedCompareExchange(&g_webHelperParked, FALSE, TRUE))
         {
-            OutputDebugStringW(L"umpdc: game ended, resuming webhelpers");
-            ResumeAllSuspended();
-
-            if (processes != NULL)
-                SetGameProcessPriority(processes, count, steamProcessId,
-                                       NORMAL_PRIORITY_CLASS);
-
-            SetSteamEfficiencyMode(FALSE);
+            OutputDebugStringW(L"umpdc: game ended, restoring webhelpers");
+            RestoreParkedWebHelpers();
         }
     }
 
     if (processes != NULL)
         HeapFree(GetProcessHeap(), 0, processes);
 
-    ResumeAllSuspended();
+    RestoreParkedWebHelpers();
     return 0;
 }
 
-static HANDLE g_monitorThreadHandle = NULL;
-
 BOOL WINAPI DllMain(HINSTANCE instanceHandle, DWORD reason, LPVOID reserved)
 {
-    UNREFERENCED_PARAMETER(reserved);
-
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(instanceHandle);
@@ -462,7 +365,7 @@ BOOL WINAPI DllMain(HINSTANCE instanceHandle, DWORD reason, LPVOID reserved)
         if (!IsSteamClientProcess())
             return TRUE;
 
-        InitSuspendResume();
+        InitProcessInformation();
 
         OutputDebugStringW(L"umpdc: loaded in steam.exe, monitor thread starting");
 
@@ -470,31 +373,32 @@ BOOL WINAPI DllMain(HINSTANCE instanceHandle, DWORD reason, LPVOID reserved)
         if (g_stopEvent == NULL)
             return TRUE;
 
-        g_monitorThreadHandle = CreateThread(NULL, 0, MonitorThreadProc, instanceHandle, 0, NULL);
-        if (g_monitorThreadHandle == NULL)
-            return TRUE;
+        {
+            HANDLE monitorThreadHandle =
+                CreateThread(NULL, 0, MonitorThreadProc, instanceHandle, 0, NULL);
+
+            if (monitorThreadHandle == NULL)
+            {
+                CloseHandle(g_stopEvent);
+                g_stopEvent = NULL;
+                return TRUE;
+            }
+
+            CloseHandle(monitorThreadHandle);
+        }
 
         return TRUE;
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
-        if (g_stopEvent != NULL)
+        /*
+         * A successfully started worker pins this proxy until process exit.
+         * Windows has already stopped the other threads at that point, and
+         * Microsoft recommends an empty process-detach handler. In particular,
+         * waiting for a worker here can deadlock on the loader lock.
+         */
+        if (reserved == NULL && g_stopEvent != NULL)
             SetEvent(g_stopEvent);
-
-        if (g_monitorThreadHandle != NULL)
-        {
-            WaitForSingleObject(g_monitorThreadHandle, 6000);
-            CloseHandle(g_monitorThreadHandle);
-            g_monitorThreadHandle = NULL;
-        }
-
-        ResumeAllSuspended();
-
-        if (g_stopEvent != NULL)
-        {
-            CloseHandle(g_stopEvent);
-            g_stopEvent = NULL;
-        }
     }
 
     return TRUE;

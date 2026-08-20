@@ -1,16 +1,54 @@
-# Build artifacts (root)
+# Project build output
+/build/
 /Library.obj
 /State.obj
 /no-st-webhelper.dll
 /umpdc.dll
 
-# Build output
-build/
-
-# IDE
+# Visual Studio workspace and user state
 .vs/
 .vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
 
-# Windows
+# MSVC compiler and linker output
+Debug/
+Release/
+x64/
+x86/
+obj/
+bin/
+*.obj
+*.pch
+*.pdb
+*.ipdb
+*.iobj
+*.idb
+*.ilk
+*.exp
+*.lib
+*.tlog
+*.lastbuildstate
+*.log
+*.recipe
+*.buildlog
+
+# This repository intentionally versions its ready-to-copy payload.
+!/release/
+!/release/**
+
+# Visual C++ caches and generated analysis data
+ipch/
+*.ipch
+*.opendb
+.cache/
+CodeAnalysisLog.xml
+CodeAnalysisResult.xml
+
+# Windows Explorer metadata
 Thumbs.db
 Desktop.ini

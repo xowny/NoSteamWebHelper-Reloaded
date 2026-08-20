@@ -1,6 +1,6 @@
 # NoSteamWebHelper Reloaded
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 
 `NoSteamWebHelper Reloaded` is a maintained compatibility fork of the original `NoSteamWebHelper` DLL mod for current Steam builds.
@@ -9,7 +9,7 @@ Original upstream project:
 
 - https://github.com/Aetopia/NoSteamWebHelper
 
-It keeps Steam's browser stack available while idle, then disables `steamwebhelper.exe` automatically when Steam is running a game. The current build prioritizes compatibility.
+It keeps Steam's browser stack available while idle, then automatically parks `steamwebhelper.exe` in a low-impact mode while Steam is running a game. The current build prioritizes compatibility and stable game frametimes.
 
 ## What changed
 
@@ -18,6 +18,8 @@ It keeps Steam's browser stack available while idle, then disables `steamwebhelp
 - Only activates the mod logic inside `steam.exe`.
 - Defers startup work until Steam finishes its early browser bootstrap.
 - Ships in automatic mode only. The tray toggle is intentionally disabled in this build.
+- Keeps WebHelper responsive while gaming, using a lower priority and Windows Efficiency Mode instead of suspending its threads.
+- Takes a process snapshot only when a game starts rather than continuously while the game is running.
 
 ## Install
 

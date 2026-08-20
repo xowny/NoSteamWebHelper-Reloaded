@@ -19,16 +19,14 @@ static void ExpectBool(BOOL expected, BOOL actual, const char *name)
 
 int main(void)
 {
-    ExpectBool(TRUE, ShouldDisableWebHelper(2531310, TRUE, FALSE, WEBHELPER_AUTO),
-               "RunningAppID with Running flag disables even without visible child process");
-    ExpectBool(TRUE, ShouldDisableWebHelper(2531310, TRUE, TRUE, WEBHELPER_AUTO),
-               "active game disables webhelper");
-    ExpectBool(FALSE, ShouldDisableWebHelper(0, FALSE, FALSE, WEBHELPER_AUTO),
-               "idle Steam keeps webhelper enabled");
-    ExpectBool(FALSE, ShouldDisableWebHelper(2531310, TRUE, TRUE, WEBHELPER_FORCE_ENABLE),
-               "manual On overrides auto-disable");
-    ExpectBool(TRUE, ShouldDisableWebHelper(0, FALSE, FALSE, WEBHELPER_FORCE_DISABLE),
-               "manual Off overrides auto-enable");
+    ExpectBool(TRUE, ShouldParkWebHelper(2531310, TRUE),
+               "RunningAppID with Running flag parks webhelper");
+    ExpectBool(FALSE, ShouldParkWebHelper(0, FALSE),
+               "idle Steam keeps webhelper at its original settings");
+    ExpectBool(FALSE, ShouldParkWebHelper(2531310, FALSE),
+               "RunningAppID without Running flag keeps webhelper enabled");
+    ExpectBool(FALSE, ShouldParkWebHelper(0, TRUE),
+               "Running flag without RunningAppID keeps webhelper enabled");
 
     return g_failures == 0 ? 0 : 1;
 }
