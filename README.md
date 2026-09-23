@@ -19,6 +19,7 @@ It keeps Steam's browser stack available while idle, then automatically parks `s
 - Defers startup work until Steam finishes its early browser bootstrap.
 - Ships in automatic mode only. The tray toggle is intentionally disabled in this build.
 - Keeps WebHelper responsive while gaming, using a lower priority and Windows Efficiency Mode instead of suspending its threads.
+- Trims WebHelper's resident memory when a game starts and keeps it low-priority for reclaiming, instead of suspending or killing the process (which would break the Steam window and overlay).
 - Takes a process snapshot only when a game starts rather than continuously while the game is running.
 
 ## Install

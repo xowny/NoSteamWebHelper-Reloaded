@@ -2,6 +2,7 @@
 
 ## 1.2
 
+- Trim each parked `steamwebhelper.exe`'s working set when a game starts, hold it at `MEMORY_PRIORITY_VERY_LOW` for the duration, and keep re-trimming it once per second for as long as the game runs (so it can't creep back up while idling at low priority). WebHelper keeps running (IPC, overlay, and the Steam window stay functional); only its resident memory footprint is given back, restored to its original priority when the game ends.
 - Replaced full `steamwebhelper.exe` thread suspension with reversible `BELOW_NORMAL` priority and Windows Efficiency Mode. This avoids Steam IPC stalls that could produce sharp frametime and uncapped-FPS swings.
 - Removed the system-wide process snapshot and repeated priority changes that previously ran every four seconds during gameplay. A snapshot is now taken only once when a game starts.
 - Restores the original WebHelper priority and power-throttling state when the game exits.

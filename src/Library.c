@@ -13,6 +13,8 @@ typedef struct PARKED_PROCESS
     DWORD originalPriorityClass;
     BOOL originalEfficiencyMode;
     BOOL hasOriginalEfficiencyMode;
+    DWORD originalMemoryPriority;
+    BOOL hasOriginalMemoryPriority;
 } PARKED_PROCESS;
 
 #define MAX_PARKED_PROCESSES 64
@@ -155,14 +157,7 @@ static BOOL IsDescendantProcess(const PROCESS_NODE *processes, DWORD count, DWOR
 
 static void SetEfficiencyMode(HANDLE processHandle, BOOL enable)
 {
-    /*
-     * SetProcessInformation with ProcessPowerThrottling enables the
-     * "Efficiency mode" (EcoQoS) badge in Task Manager and asks the
-     * scheduler to deprioritise the process for background operation.
-     *
-     * Available since Windows 10 (build 1511+).  We load the function
-     * dynamically so the DLL degrades gracefully on older systems.
-     */
+    // https://github.com/xowny/NoSteamWebHelper-Reloaded/pull/1#issuecomment-5770184836
     PROCESS_POWER_THROTTLING_STATE ppt = {};
 
     if (g_SetProcessInformation == NULL)
@@ -173,6 +168,24 @@ static void SetEfficiencyMode(HANDLE processHandle, BOOL enable)
     ppt.StateMask   = enable ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
 
     g_SetProcessInformation(processHandle, ProcessPowerThrottling, &ppt, sizeof(ppt));
+}
+
+static void SetMemoryPriorityValue(HANDLE processHandle, DWORD priority)
+{
+    /*
+     * MemoryPriority biases the working-set trim order: pages of a
+     * VERY_LOW priority process are reclaimed first under any system
+     * memory pressure. Unlike suspending the process, WebHelper keeps
+     * running and keeps its IPC connection (Steam window, overlay) alive;
+     * it just gives its RAM back first when something else needs it.
+     */
+    MEMORY_PRIORITY_INFORMATION mpi = {};
+
+    if (g_SetProcessInformation == NULL)
+        return;
+
+    mpi.MemoryPriority = priority;
+    g_SetProcessInformation(processHandle, ProcessMemoryPriority, &mpi, sizeof(mpi));
 }
 
 static BOOL IsAlreadyParked(DWORD processId)
@@ -214,8 +227,8 @@ static void ParkSteamWebHelpers(const PROCESS_NODE *processes, DWORD count, DWOR
         if (g_parkedProcessCount >= MAX_PARKED_PROCESSES)
             continue;
 
-        processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION |
-                                        SYNCHRONIZE,
+        processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_QUERY_INFORMATION |
+                                        PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | SYNCHRONIZE,
                                     FALSE, processes[processIndex].processId);
         if (processHandle == NULL)
             continue;
@@ -225,9 +238,12 @@ static void ParkSteamWebHelpers(const PROCESS_NODE *processes, DWORD count, DWOR
         parked->processHandle = processHandle;
         parked->originalPriorityClass = GetPriorityClass(processHandle);
         parked->hasOriginalEfficiencyMode = FALSE;
+        parked->hasOriginalMemoryPriority = FALSE;
 
         if (g_GetProcessInformation != NULL)
         {
+            MEMORY_PRIORITY_INFORMATION originalMemoryPriority = {};
+
             originalPowerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
             parked->hasOriginalEfficiencyMode =
                 g_GetProcessInformation(processHandle, ProcessPowerThrottling,
@@ -240,17 +256,47 @@ static void ParkSteamWebHelpers(const PROCESS_NODE *processes, DWORD count, DWOR
                     (originalPowerThrottling.StateMask &
                      PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0;
             }
+
+            parked->hasOriginalMemoryPriority =
+                g_GetProcessInformation(processHandle, ProcessMemoryPriority,
+                                        &originalMemoryPriority,
+                                        sizeof(originalMemoryPriority));
+
+            if (parked->hasOriginalMemoryPriority)
+                parked->originalMemoryPriority = originalMemoryPriority.MemoryPriority;
         }
 
-        /*
-         * Keep CEF responsive so Steam IPC calls do not block the game.
-         * BELOW_NORMAL plus EcoQoS reduces background contention without
-         * the frametime spikes caused by suspending all helper threads.
-        */
         SetPriorityClass(processHandle, BELOW_NORMAL_PRIORITY_CLASS);
         if (parked->hasOriginalEfficiencyMode)
             SetEfficiencyMode(processHandle, TRUE);
+        if (parked->hasOriginalMemoryPriority)
+            SetMemoryPriorityValue(processHandle, MEMORY_PRIORITY_VERY_LOW);
+        SetProcessWorkingSetSize(processHandle, (SIZE_T)-1, (SIZE_T)-1);
+
         g_parkedProcessCount++;
+    }
+}
+
+static void TrimParkedWebHelperWorkingSets(void)
+{
+    LONG index = 0;
+    LONG parkedCount = g_parkedProcessCount;
+
+    if (parkedCount < 0)
+        parkedCount = 0;
+    else if (parkedCount > MAX_PARKED_PROCESSES)
+        parkedCount = MAX_PARKED_PROCESSES;
+
+    for (; index < parkedCount; index++)
+    {
+        HANDLE processHandle = g_parkedProcesses[index].processHandle;
+
+        if (processHandle == NULL)
+            continue;
+
+#pragma warning(suppress : 6001) /* Guarded above; array storage is statically zero-initialized. */
+        if (WaitForSingleObject(processHandle, 0) == WAIT_TIMEOUT)
+            SetProcessWorkingSetSize(processHandle, (SIZE_T)-1, (SIZE_T)-1);
     }
 }
 
@@ -282,6 +328,9 @@ static void RestoreParkedWebHelpers(void)
 
             if (parked->hasOriginalEfficiencyMode)
                 SetEfficiencyMode(parked->processHandle, parked->originalEfficiencyMode);
+
+            if (parked->hasOriginalMemoryPriority)
+                SetMemoryPriorityValue(parked->processHandle, parked->originalMemoryPriority);
         }
 
         CloseHandle(parked->processHandle);
@@ -298,11 +347,6 @@ static DWORD WINAPI MonitorThreadProc(LPVOID parameter)
     PROCESS_NODE *processes = NULL;
     UNREFERENCED_PARAMETER(parameter);
 
-    /*
-     * The proxy is intended to live for the lifetime of steam.exe.
-     * Pin it from the worker, after DllMain has released the loader lock,
-     * so Steam cannot unload code while this thread is still executing.
-     */
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_PIN,
                             (LPCWSTR)MonitorThreadProc, &pinnedModule) ||
@@ -330,19 +374,23 @@ static DWORD WINAPI MonitorThreadProc(LPVOID parameter)
 
         shouldPark = ShouldParkWebHelper(runningAppId, appMarkedRunning);
 
-        if (shouldPark &&
-            !InterlockedCompareExchange(&g_webHelperParked, TRUE, FALSE))
+        if (shouldPark)
         {
-            if (processes != NULL)
+            if (!InterlockedCompareExchange(&g_webHelperParked, TRUE, FALSE))
             {
-                DWORD count = SnapshotProcesses(processes, MAX_TRACKED_PROCESSES);
-                OutputDebugStringW(L"umpdc: game detected, parking webhelpers");
-                ParkSteamWebHelpers(processes, count, steamProcessId);
+                if (processes != NULL)
+                {
+                    DWORD count = SnapshotProcesses(processes, MAX_TRACKED_PROCESSES);
+                    OutputDebugStringW(L"umpdc: game detected, parking webhelpers");
+                    ParkSteamWebHelpers(processes, count, steamProcessId);
+                }
             }
-
+            else
+            {
+                TrimParkedWebHelperWorkingSets();
+            }
         }
-        else if (!shouldPark &&
-                 InterlockedCompareExchange(&g_webHelperParked, FALSE, TRUE))
+        else if (InterlockedCompareExchange(&g_webHelperParked, FALSE, TRUE))
         {
             OutputDebugStringW(L"umpdc: game ended, restoring webhelpers");
             RestoreParkedWebHelpers();
@@ -391,12 +439,6 @@ BOOL WINAPI DllMain(HINSTANCE instanceHandle, DWORD reason, LPVOID reserved)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
-        /*
-         * A successfully started worker pins this proxy until process exit.
-         * Windows has already stopped the other threads at that point, and
-         * Microsoft recommends an empty process-detach handler. In particular,
-         * waiting for a worker here can deadlock on the loader lock.
-         */
         if (reserved == NULL && g_stopEvent != NULL)
             SetEvent(g_stopEvent);
     }
